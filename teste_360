@@ -1,0 +1,391 @@
+/* Robo gira em intervalos de 90° até dar uma volta completa
+ */
+
+// ---- Ganhos do PID (ajuste aqui) ----
+double KP_GIRO = 0.3;
+double KI_GIRO = 0.0;
+double KD_GIRO = 0.0;
+
+// ---- Outros parametros do teste ----
+const float  ANGULO_POR_SEGMENTO   = 90.0;   // graus por etapa
+const int    NUM_SEGMENTOS         = 4;      // 4x90 = 360
+// Sentido do giro, expresso em termos do YAW medido:
+//   +1 = girar de modo que o yaw AUMENTE
+//   -1 = girar de modo que o yaw DIMINUA
+const int    SENTIDO_GIRO          = 1;
+
+const int    RT_PARA_YAW_POSITIVO  = -1;
+
+const float  VELOCIDADE_MAX = 0.75;   // teto do Rt (0.0 a 1.0)
+const float  VELOCIDADE_MIN = 0.55;   // piso do Rt enquanto ainda esta girando
+const float  TOLERANCIA_CHEGADA = 1.5; // graus: considera "chegou" dentro dessa margem
+
+const unsigned long TEMPO_MAX_SEGMENTO_MS = 7000; // seguranca: aborta o segmento se passar disso
+                                                   // (90 graus a ~30 graus/s leva ~3 s; 7 s da folga)
+const unsigned long ESPERA_PARADO_MS      = 2000; // pausa entre segmentos
+
+// ---- Fim dos parametros de sintonia ----
+
+
+#include "FastIMU.h"
+#include <MadgwickAHRS.h>
+#include <PID_v1.h>
+#include <Wire.h>
+
+#define IMU_ADDRESS 0x68
+MPU9250  IMU;
+Madgwick filter;
+calData  calib = { 0 };
+AccelData accelData;
+GyroData  gyroData;
+float yaw = 0, yawAnterior = 0;
+
+// ---- Motores (pinagem testada) ----
+const int motorA_EN = 1;  const int motorA_PWM = 2;  // Frente esquerda
+const int motorB_EN = 4;  const int motorB_PWM = 3;  // Frente direita
+const int motorC_EN = 5;  const int motorC_PWM = 6;  // Tras esquerda
+const int motorD_EN = 8;  const int motorD_PWM = 7;  // Tras direita
+int N = 110;
+int LeftFront = 0, RightFront = 0, LeftBack = 0, RightBack = 0;
+
+// ---- PID (biblioteca) ----
+// v4: CORRECAO DE SINAL. A biblioteca calcula erro = Setpoint - Input.
+// Antes: Setpoint=0, Input=faltam  -> erro NEGATIVO -> saida travada em 0.
+// Agora: Setpoint=90 (alvo), Input=quanto ja girou -> erro = faltam, POSITIVO.
+double pidInput;         // quanto JA GIROU no segmento (graus)
+double pidOutput;        // velocidade calculada (0 a VELOCIDADE_MAX)
+double pidSetpoint = ANGULO_POR_SEGMENTO;  // alvo: girar 90 graus
+
+PID meuPID(&pidInput, &pidOutput, &pidSetpoint, KP_GIRO, KI_GIRO, KD_GIRO, DIRECT);
+
+// ---- Estado do teste ----
+bool     testeAtivo      = false;
+bool     emEspera        = false;
+int      segmentoAtual   = 0;               // 1..NUM_SEGMENTOS
+float    anguloAcumulado = 0;               // quanto ja girou NESTE segmento (sempre >=0)
+unsigned long inicioSegmentoMs = 0;
+unsigned long inicioEsperaMs   = 0;
+float    yawAoFinalDeCadaSeg[16];           // guarda o yaw real ao fim de cada segmento
+float    yawReferenciaInicial = 0;
+float    ultimoRtAplicado = 999;            // evita "picotar" o PWM reescrevendo
+unsigned long ultimaAplicacaoMs = 0;        // sempre o mesmo comando
+
+float    gzAnterior = 0, axAnterior = 0;
+int      ciclosCongelados = 0;
+int      reinicializacoesIMU = 0;
+
+// Mantem um angulo em [-180, 180]
+float normaliza(float e) {
+  while (e >  180) e -= 360;
+  while (e < -180) e += 360;
+  return e;
+}
+
+void setup() {
+  pinMode(motorA_EN, OUTPUT);  pinMode(motorA_PWM, OUTPUT);
+  pinMode(motorB_EN, OUTPUT);  pinMode(motorB_PWM, OUTPUT);
+  pinMode(motorC_EN, OUTPUT);  pinMode(motorC_PWM, OUTPUT);
+  pinMode(motorD_EN, OUTPUT);  pinMode(motorD_PWM, OUTPUT);
+  pararTudo();
+
+  Wire.setSDA(16);
+  Wire.setSCL(17);
+  Wire.begin();
+  Wire.setClock(100000);   // v5: 100 kHz em vez de 400 kHz — mais tolerante
+                           // ao ruido eletrico dos motores no barramento I2C
+  Serial.begin(115200);
+  unsigned long t0 = millis();
+  while (!Serial && millis() - t0 < 3000) { ; }
+
+  Serial.println("===== TESTE 360 com PID (Kp/Ki/Kd ajustaveis) =====");
+
+  if (IMU.init(calib, IMU_ADDRESS) != 0) {
+    Serial.println("ERRO ao iniciar IMU!");
+    while (true) { ; }
+  }
+
+  Serial.println("Mantenha o robo PARADO! Calibrando em 5s...");
+  delay(5000);
+  Serial.println("Calibrando... NAO MEXA!");
+  IMU.calibrateAccelGyro(&calib);
+  delay(1000);
+  IMU.init(calib, IMU_ADDRESS);
+  filter.begin(100);
+
+  yaw = filter.getYaw();
+  yawAnterior = yaw;
+
+  // ---- Configura o PID ----
+  meuPID.SetOutputLimits(0, VELOCIDADE_MAX);  // saida = velocidade (0 ate o teto)
+  meuPID.SetSampleTime(10);                    // 10 ms = 100 Hz
+  meuPID.SetMode(MANUAL);                      // so calcula durante o giro
+  pidOutput = 0;
+
+  Serial.println("Pronto!");
+  Serial.println(">>> ROBO SUSPENSO para a bancada <<<");
+  Serial.println("Comandos: z = iniciar teste 360   s = parar/cancelar   k = mostra ganhos");
+  Serial.println("Sintonia: q/j=Kp+/-0.05  w/x=Ki+/-0.01  e/c=Kd+/-0.01");
+  mostraGanhos();
+}
+
+void loop() {
+  // ---- Comandos ----
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'z' && !testeAtivo) {
+      iniciarTeste();
+    } else if (c == 's') {
+      cancelarTeste();
+    } else if (c == 'k') {
+      mostraGanhos();
+    } else if (c == 'q') { KP_GIRO += 0.05; atualizaGanhos(); }
+    else if (c == 'j') { KP_GIRO -= 0.05; if (KP_GIRO < 0) KP_GIRO = 0; atualizaGanhos(); }
+    else if (c == 'w') { KI_GIRO += 0.01; atualizaGanhos(); }
+    else if (c == 'x') { KI_GIRO -= 0.01; if (KI_GIRO < 0) KI_GIRO = 0; atualizaGanhos(); }
+    else if (c == 'e') { KD_GIRO += 0.01; atualizaGanhos(); }
+    else if (c == 'c') { KD_GIRO -= 0.01; if (KD_GIRO < 0) KD_GIRO = 0; atualizaGanhos(); }
+  }
+
+  // ---- Atualiza IMU a 100 Hz ----
+  static uint32_t nextUpdate = 0;
+  uint32_t now = millis();
+  if (now >= nextUpdate) {
+    nextUpdate = now + 10;
+
+    IMU.update();
+    IMU.getAccel(&accelData);
+    IMU.getGyro(&gyroData);
+
+    bool identico = (abs(gyroData.gyroZ - gzAnterior) < 0.0001f) &&
+                    (abs(accelData.accelX - axAnterior) < 0.0001f);
+    gzAnterior = gyroData.gyroZ;
+    axAnterior = accelData.accelX;
+    if (identico) ciclosCongelados++; else ciclosCongelados = 0;
+
+    if (ciclosCongelados >= 30) {
+      ciclosCongelados = 0;
+      reinicializacoesIMU++;
+      Serial.print("   !!! IMU CONGELADA (dados identicos 300ms). Reinicializando... #");
+      Serial.println(reinicializacoesIMU);
+      Wire.end();
+      delay(5);
+      Wire.setSDA(16);
+      Wire.setSCL(17);
+      Wire.begin();
+      Wire.setClock(100000);
+      IMU.init(calib, IMU_ADDRESS);   // reaplica a calibracao ja feita
+    }
+
+    filter.updateIMU(
+      gyroData.gyroX,   gyroData.gyroY,   gyroData.gyroZ,
+      accelData.accelX, accelData.accelY, accelData.accelZ
+    );
+
+    yawAnterior = yaw;
+    yaw = filter.getYaw();
+
+    if (testeAtivo) {
+      atualizaTeste(now);
+    }
+  }
+}
+
+void atualizaGanhos() {
+  meuPID.SetTunings(KP_GIRO, KI_GIRO, KD_GIRO);
+  mostraGanhos();
+}
+
+void mostraGanhos() {
+  Serial.print("Kp="); Serial.print(KP_GIRO, 3);
+  Serial.print("  Ki="); Serial.print(KI_GIRO, 3);
+  Serial.print("  Kd="); Serial.println(KD_GIRO, 3);
+}
+
+// ===================== LOGICA DO TESTE =====================
+void iniciarTeste() {
+  Serial.println("\n===== INICIANDO TESTE: 4x 90 graus =====");
+  yawReferenciaInicial = yaw;
+  segmentoAtual   = 1;
+  anguloAcumulado = 0;
+  testeAtivo      = true;
+  emEspera        = false;
+  inicioSegmentoMs = millis();
+  ultimoRtAplicado = 999;
+  ultimaAplicacaoMs = 0;
+
+  meuPID.SetMode(AUTOMATIC);  // so calcula a partir de agora
+
+  Serial.print(">> Segmento 1/"); Serial.print(NUM_SEGMENTOS);
+  Serial.println(" -- comecando a girar.");
+}
+
+void cancelarTeste() {
+  testeAtivo = false;
+  emEspera   = false;
+  meuPID.SetMode(MANUAL);
+  pidOutput = 0;
+  pararTudo();
+  Serial.println(">> Teste cancelado/parado. Motores parados.");
+}
+
+void atualizaTeste(uint32_t now) {
+  if (!emEspera) {
+    // ---- Acumula o quanto girou de verdade (imune a ambiguidade de posicao) ----
+    float delta = normaliza(yaw - yawAnterior);
+    anguloAcumulado += delta * SENTIDO_GIRO;   // SENTIDO_GIRO e em termos de yaw
+
+    static bool avisouSentido = false;
+    if (anguloAcumulado < -15.0 && !avisouSentido) {
+      avisouSentido = true;
+      Serial.println("   !!! ATENCAO: girado esta NEGATIVO -> o robo gira ao contrario.");
+      Serial.println("   !!! Troque o sinal de RT_PARA_YAW_POSITIVO no topo do codigo.");
+    }
+    if (anguloAcumulado > 0) avisouSentido = false;
+
+    float faltam = ANGULO_POR_SEGMENTO - anguloAcumulado;
+    if (faltam < 0) faltam = 0;   // nao deixa o PID ver erro negativo aqui
+    bool chegou   = faltam <= TOLERANCIA_CHEGADA;
+    bool estourou = (now - inicioSegmentoMs) > TEMPO_MAX_SEGMENTO_MS;
+
+    // ---- Debug: imprime a cada 200 ms ----
+    static uint32_t nextDebug = 0;
+    if (now >= nextDebug) {
+      nextDebug = now + 200;
+      Serial.print("[seg "); Serial.print(segmentoAtual);
+      Serial.print("] girado="); Serial.print(anguloAcumulado, 1);
+      Serial.print(" / "); Serial.print(ANGULO_POR_SEGMENTO, 1);
+      Serial.print("  faltam="); Serial.print(faltam, 1);
+      Serial.print("  out="); Serial.print(pidOutput, 3);
+      Serial.print("  yaw="); Serial.print(yaw, 1);
+      Serial.print("  gZ="); Serial.print(gyroData.gyroZ, 1);   // deg/s bruto: deve ser != 0 girando
+      Serial.print("  cong="); Serial.println(ciclosCongelados);
+    }
+
+    if (chegou || estourou) {
+      if (estourou && !chegou) {
+        Serial.println("   (aviso: tempo maximo estourado)");
+      }
+      meuPID.SetMode(MANUAL);
+      pidOutput = 0;
+      pararTudo();
+      yawAoFinalDeCadaSeg[segmentoAtual - 1] = yaw;
+      Serial.print("   Chegou! Girou "); Serial.print(anguloAcumulado, 1);
+      Serial.print(" graus. Yaw real: "); Serial.println(yaw, 1);
+      emEspera = true;
+      inicioEsperaMs = now;
+    } else {
+      // ---- PID calcula a velocidade ----
+      // Input = quanto ja girou; Setpoint = 90. Erro interno = 90 - girado = faltam.
+      pidInput = anguloAcumulado;
+      meuPID.Compute();
+
+      float velocidade = pidOutput;
+      if (velocidade < VELOCIDADE_MIN) velocidade = VELOCIDADE_MIN; // piso: vence o atrito
+      if (velocidade > VELOCIDADE_MAX) velocidade = VELOCIDADE_MAX;
+
+      // Rt = velocidade x sentido desejado (em yaw) x relacao de hardware
+      float rtComSentido = velocidade * SENTIDO_GIRO * RT_PARA_YAW_POSITIVO;
+
+      // So reaplica se o comando mudou de verdade, ou a cada 300 ms como
+      // garantia. Evita reescrever o PWM 100x/s (motor apita sem girar).
+      bool mudou     = abs(rtComSentido - ultimoRtAplicado) > 0.02;
+      bool periodico = (now - ultimaAplicacaoMs) > 300;
+      if (mudou || periodico) {
+        move_robot(0, 0, rtComSentido);
+        ultimoRtAplicado = rtComSentido;
+        ultimaAplicacaoMs = now;
+        // DEBUG: confirma o comando que chegou aos motores
+        Serial.print("   [motores] Rt="); Serial.print(rtComSentido, 2);
+        Serial.print("  PWM(LF,RF,LB,RB)=");
+        Serial.print(LeftFront);  Serial.print(",");
+        Serial.print(RightFront); Serial.print(",");
+        Serial.print(LeftBack);   Serial.print(",");
+        Serial.println(RightBack);
+      }
+    }
+
+  } else {
+    // ---- Fase de espera parado (2s) entre segmentos ----
+    if ((now - inicioEsperaMs) > ESPERA_PARADO_MS) {
+      if (segmentoAtual < NUM_SEGMENTOS) {
+        segmentoAtual++;
+        anguloAcumulado = 0;
+        emEspera = false;
+        inicioSegmentoMs = now;
+        ultimoRtAplicado = 999;
+        ultimaAplicacaoMs = 0;
+        meuPID.SetMode(AUTOMATIC);
+        Serial.print(">> Segmento "); Serial.print(segmentoAtual);
+        Serial.print("/"); Serial.print(NUM_SEGMENTOS);
+        Serial.println(" -- comecando a girar.");
+      } else {
+        finalizarTeste();
+      }
+    }
+  }
+}
+
+void finalizarTeste() {
+  testeAtivo = false;
+  emEspera   = false;
+  meuPID.SetMode(MANUAL);
+  pidOutput = 0;
+  pararTudo();
+
+  float voltaCompleta = normaliza(yaw - yawReferenciaInicial);
+
+  Serial.println("\n===== RESUMO DO TESTE =====");
+  Serial.print("Yaw inicial (referencia): "); Serial.println(yawReferenciaInicial, 1);
+  for (int i = 0; i < NUM_SEGMENTOS; i++) {
+    Serial.print("  Apos segmento "); Serial.print(i + 1);
+    Serial.print(": yaw = "); Serial.println(yawAoFinalDeCadaSeg[i], 1);
+  }
+  Serial.print("Yaw final: "); Serial.println(yaw, 1);
+  Serial.print(">>> ERRO DE FECHAMENTO DA VOLTA: ");
+  Serial.print(voltaCompleta, 1);
+  Serial.println(" graus (ideal = 0)");
+  Serial.println("============================\n");
+}
+
+// ===================== FUNCOES TESTADAS (nao alterar) =====================
+void setMotor(int enPin, int pwmPin, int velocidade) {
+  int veloAbs = abs(velocidade);
+  if (velocidade > 0) {
+    analogWrite(enPin, 0);
+    analogWrite(pwmPin, veloAbs);
+  } else if (velocidade < 0) {
+    analogWrite(enPin, veloAbs);
+    analogWrite(pwmPin, 0);
+  } else {
+    analogWrite(pwmPin, 0);
+    analogWrite(enPin, 0);
+  }
+}
+
+void move_robot(float Ly, float Lx, float Rt) {
+  float LF = Ly + Lx + Rt;
+  float RF = Ly - Lx - Rt;
+  float LB = Ly - Lx + Rt;
+  float RB = Ly + Lx - Rt;
+
+  float ALF = abs(LF), ARF = abs(RF), ALB = abs(LB), ARB = abs(RB);
+  float maior = max(max(ALF, ARF), max(ALB, ARB));
+  float Multi = (maior <= 1) ? (255 - N) : (255 - N) / maior;
+
+  LeftFront  = (LF > 0) ? (int)(LF * Multi + N) : (LF < 0) ? (int)(LF * Multi - N) : 0;
+  RightFront = (RF > 0) ? (int)(RF * Multi + N) : (RF < 0) ? (int)(RF * Multi - N) : 0;
+  LeftBack   = (LB > 0) ? (int)(LB * Multi + N) : (LB < 0) ? (int)(LB * Multi - N) : 0;
+  RightBack  = (RB > 0) ? (int)(RB * Multi + N) : (RB < 0) ? (int)(RB * Multi - N) : 0;
+
+  setMotor(motorA_EN, motorA_PWM, LeftFront);
+  setMotor(motorB_EN, motorB_PWM, RightFront);
+  setMotor(motorC_EN, motorC_PWM, LeftBack);
+  setMotor(motorD_EN, motorD_PWM, RightBack);
+}
+
+void pararTudo() {
+  setMotor(motorA_EN, motorA_PWM, 0);
+  setMotor(motorB_EN, motorB_PWM, 0);
+  setMotor(motorC_EN, motorC_PWM, 0);
+  setMotor(motorD_EN, motorD_PWM, 0);
+}
